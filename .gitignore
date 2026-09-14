@@ -1,0 +1,23 @@
+# Build artifacts
+build/
+*.o
+*.so
+*.dll
+*.dylib
+
+# Model files
+*.bin
+*.pth
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
