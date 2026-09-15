@@ -23,7 +23,11 @@ CXX_FAST  = -O3 -march=native -fopenmp -flto -funroll-loops -falign-loops=64 -Wn
 # CXX_PGO_G = $(CXX_FAST) -fprofile-generate -fprofile-dir=build/pgo
 # CXX_PGO_U = $(CXX_FAST) -fprofile-use -fprofile-correction -fprofile-dir=build/pgo
 LDFLAGS   = -lm -flto
-INCLUDES  = -Isrc
+INCLUDES  = -Isrc -Isrc/npu -Isrc/sampling -Ithird_party/openvino/include
+
+# OpenVINO library path (from pip wheel)
+OVLIB     := $(shell python3 -c 'import openvino,os;print(os.path.join(os.path.dirname(openvino.__file__),"libs"))')
+OV_LDFLAGS = -L$(OVLIB) -l:libopenvino.so.2631 -Wl,-rpath,$(OVLIB)
 
 SRC_DIR   = src
 TEST_DIR  = tests
@@ -43,7 +47,7 @@ LIB_NAME_BF16 = librwkv_bf16.so
 
 # ── Default target ────────────────────────────────────────────────
 .PHONY: all
-all: lib test_speed test_correct test_spec test_utils16 test_utils16_bf16
+all: lib test_speed test_correct test_spec test_utils16 test_utils16_bf16 chat
 
 # ── Build directory ───────────────────────────────────────────────
 $(BUILD_DIR):
@@ -125,6 +129,23 @@ test_ablate: $(BUILD_DIR)/test_ablate
 # 	rm -f $(BUILD_DIR)/*.gcda
 # 	rm -rf $(BUILD_DIR)/pgo
 # 	@echo "PGO optimized binary: build/test_speed_pgo"
+
+# ── Chat example (with NPU speculative decoding) ──────────────────
+SPEC_SRCS = $(SRC_DIR)/npu/spec.cpp
+SPEC_DEPS = $(SRC_DIR)/npu/spec.cpp $(SRC_DIR)/npu/spec_api.h $(SRC_DIR)/npu/spec_sampler.h \
+            $(SRC_DIR)/npu/npu_window.h $(SRC_DIR)/npu/common.h $(SRC_DIR)/chat_callback.h
+$(BUILD_DIR)/chat: examples/chat.cpp $(SPEC_SRCS) $(LIB_SRCS) $(ENGINE_DEPS) $(SPEC_DEPS) | $(BUILD_DIR)
+	$(CXX) $(CXX_FAST) $(INCLUDES) -o $@ $< $(SPEC_SRCS) $(LIB_SRCS) $(LDFLAGS) $(OV_LDFLAGS) -lpthread
+
+.PHONY: chat
+chat: $(BUILD_DIR)/chat
+
+# ── NPU spec example (requires OpenVINO + NPU blob) ──────────────
+# $(BUILD_DIR)/spec_npu: src/npu/spec.cpp $(LIB_SRCS) $(ENGINE_DEPS) | $(BUILD_DIR)
+#	$(CXX) $(CXX_FAST) $(INCLUDES) -o $@ $< $(LIB_SRCS) $(LDFLAGS) -lopenvino
+#
+# .PHONY: spec_npu
+# spec_npu: $(BUILD_DIR)/spec_npu
 
 # ── Clean ─────────────────────────────────────────────────────────
 .PHONY: clean
