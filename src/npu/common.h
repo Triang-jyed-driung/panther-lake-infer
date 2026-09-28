@@ -17,6 +17,7 @@
 #endif
 
 #include "../gemm_fp16.h"
+#include "../rwkv_tune.h"
 
 // fp16 位型 → float（可移植，不依赖硬件 F16C）
 static inline float f16_to_f32(uint16_t h) {
@@ -33,14 +34,8 @@ static inline double now_ms() {
 }
 
 // CPU环境初始化
-static void setup_cpu(int n_cores = 4) {
-#ifdef __linux__
-    cpu_set_t cs; CPU_ZERO(&cs);
-    for (int i = 0; i < n_cores; i++) CPU_SET(i, &cs);
-    sched_setaffinity(0, sizeof(cs), &cs);
-#endif
-    omp_set_num_threads(n_cores);
-    gemm_fp16_set_num_threads(n_cores);
+static void setup_cpu(int n_cores = RWKV_BIND_CORES) {
+    rwkv_tune_once(n_cores);
 }
 
 // 融合嵌入表封装（mmap 只读，[V,D] fp16 连续布局）

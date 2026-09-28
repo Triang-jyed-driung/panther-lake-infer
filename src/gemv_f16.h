@@ -25,6 +25,8 @@
 #include <cblas.h>
 #endif
 #include <vector>
+#include <algorithm>
+#include <cstdlib>
 
 #include "utils_16.h"   /* to_f32 / load_16x8 — format picked at compile time */
 
@@ -76,15 +78,18 @@ static inline void gemv_f16_mt_rows(
     int need = nth * N;
     if (need > py_cap) {
         free(py_buf);
-        py_buf = (float *)aligned_alloc(64, need * sizeof(float));
+        py_buf = (float *)aligned_alloc(64, ((size_t)need * sizeof(float) + 63) & ~size_t(63));
         py_cap = need;
     }
 
+    int used = 1;
     #pragma omp parallel
     {
         int tid = omp_get_thread_num();
-        int i0  = (int)((size_t)tid      * M / nth);
-        int i1  = (int)((size_t)(tid + 1) * M / nth);
+        int team = omp_get_num_threads();
+        if (tid == 0) used = team;
+        int i0  = (int)((size_t)tid      * M / team);
+        int i1  = (int)((size_t)(tid + 1) * M / team);
         float *py = py_buf + tid * N;
         for (int j = 0; j <= N - 8; j += 8) _mm256_storeu_ps(py+j,_mm256_setzero_ps());
         for (int j = (N/8)*8; j < N; j++) py[j] = 0;
@@ -104,10 +109,10 @@ static inline void gemv_f16_mt_rows(
     #pragma omp parallel for schedule(static)
     for (int j = 0; j <= N - 8; j += 8) {
         __m256 sum = _mm256_setzero_ps();
-        for (int t = 0; t < nth; t++) sum = _mm256_add_ps(sum, _mm256_loadu_ps(py_buf + t * N + j));
+        for (int t = 0; t < used; t++) sum = _mm256_add_ps(sum, _mm256_loadu_ps(py_buf + t * N + j));
         _mm256_storeu_ps(y + j, sum);
     }
-    for (int j = (N/8)*8; j < N; j++) {float s=0;for(int t=0;t<nth;t++)s+=py_buf[t*N+j];y[j]=s;}
+    for (int j = (N/8)*8; j < N; j++) {float s=0;for(int t=0;t<used;t++)s+=py_buf[t*N+j];y[j]=s;}
 }
 
 /* ── multi-threaded: column-partitioned (each thread owns a contiguous slice of y) ─ */
@@ -118,8 +123,8 @@ static inline void gemv_f16_mt_cols(
     {
         int tid = omp_get_thread_num();
         int nth = omp_get_num_threads();
-        int j0  = (int)((size_t)tid      * N / nth);
-        int j1  = (int)((size_t)(tid + 1) * N / nth);
+        int j0 = (int)((size_t)tid * ((N + 31) / 32) / nth) * 32;
+        int j1 = std::min(N, (int)((size_t)(tid + 1) * ((N + 31) / 32) / nth) * 32);
         if (j0 >= j1)
             ; /* nothing to do for this thread */
         else {
@@ -138,18 +143,24 @@ static inline void gemv_f16_mt_cols(
 
             int j = j0;
 
-            /* 16-wide */
-            for (; j + 15 < j1; j += 16) {
+            /* Four independent FMA chains hide conversion/FMA latency. */
+            for (; j + 31 < j1; j += 32) {
                 __m256 a0 = _mm256_loadu_ps(y + j);
                 __m256 a1 = _mm256_loadu_ps(y + j + 8);
+                __m256 a2 = _mm256_loadu_ps(y + j + 16);
+                __m256 a3 = _mm256_loadu_ps(y + j + 24);
                 for (int i = ib; i < ie; i++) {
                     __m256 xv = _mm256_set1_ps(x[i]);
-                    const uint16_t *row = W + i * N;
-                    a0 = _mm256_fmadd_ps(xv, load_16x8(row + j), a0);
-                    a1 = _mm256_fmadd_ps(xv, load_16x8(row + j + 8), a1);
+                    const uint16_t *row = W + (size_t)i * N + j;
+                    a0 = _mm256_fmadd_ps(xv, load_16x8(row), a0);
+                    a1 = _mm256_fmadd_ps(xv, load_16x8(row + 8), a1);
+                    a2 = _mm256_fmadd_ps(xv, load_16x8(row + 16), a2);
+                    a3 = _mm256_fmadd_ps(xv, load_16x8(row + 24), a3);
                 }
-                _mm256_storeu_ps(y + j,     a0);
+                _mm256_storeu_ps(y + j, a0);
                 _mm256_storeu_ps(y + j + 8, a1);
+                _mm256_storeu_ps(y + j + 16, a2);
+                _mm256_storeu_ps(y + j + 24, a3);
             }
 
             /* 8-wide */
@@ -242,7 +253,7 @@ static inline void gemv_f16_sparse(
     std::vector<int>   nnz_idx; nnz_idx.reserve(M);
     std::vector<float> nnz_val; nnz_val.reserve(M);
 
-    for (int i = 0; i < M; i += 8) {
+    for (int i = 0; i + 8 <= M; i += 8) {
         __m256 kv  = _mm256_loadu_ps(k_f32 + i);
         __m256 cmp = _mm256_cmp_ps(kv, _mm256_setzero_ps(), _CMP_NEQ_UQ);
         uint32_t mask = _mm256_movemask_ps(cmp);
@@ -251,6 +262,12 @@ static inline void gemv_f16_sparse(
             nnz_idx.push_back(i + bit);
             nnz_val.push_back(k_f32[i + bit]);
             mask &= mask - 1;
+        }
+    }
+    for (int i = (M / 8) * 8; i < M; ++i) {
+        if (k_f32[i] != 0.0f) {
+            nnz_idx.push_back(i);
+            nnz_val.push_back(k_f32[i]);
         }
     }
     int nnz = (int)nnz_idx.size();
@@ -263,27 +280,39 @@ static inline void gemv_f16_sparse(
         int j0  = (int)((size_t)tid      * N / nth);
         int j1  = (int)((size_t)(tid + 1) * N / nth);
 
-        for (int n = 0; n < nnz; n++) {
-            int   idx = nnz_idx[n];
-            float val = nnz_val[n];
-            __m256 xv = _mm256_set1_ps(val);
-            const uint16_t *row = V + idx * N;
-
+        // Reuse each output vector across eight nonzero rows, reducing
+        // accumulator loads/stores while keeping four FMA chains in flight.
+        for (int nb = 0; nb < nnz; nb += 8) {
+            const int ne = std::min(nnz, nb + 8);
             int j = j0;
-            for (; j + 15 < j1; j += 16) {
+            for (; j + 31 < j1; j += 32) {
                 __m256 a0 = _mm256_loadu_ps(y + j);
                 __m256 a1 = _mm256_loadu_ps(y + j + 8);
-                a0 = _mm256_fmadd_ps(xv, load_16x8(row + j), a0);
-                a1 = _mm256_fmadd_ps(xv, load_16x8(row + j + 8), a1);
-                _mm256_storeu_ps(y + j,     a0);
+                __m256 a2 = _mm256_loadu_ps(y + j + 16);
+                __m256 a3 = _mm256_loadu_ps(y + j + 24);
+                for (int n = nb; n < ne; ++n) {
+                    __m256 xv = _mm256_set1_ps(nnz_val[n]);
+                    const uint16_t *row = V + (size_t)nnz_idx[n] * N + j;
+                    a0 = _mm256_fmadd_ps(xv, load_16x8(row), a0);
+                    a1 = _mm256_fmadd_ps(xv, load_16x8(row + 8), a1);
+                    a2 = _mm256_fmadd_ps(xv, load_16x8(row + 16), a2);
+                    a3 = _mm256_fmadd_ps(xv, load_16x8(row + 24), a3);
+                }
+                _mm256_storeu_ps(y + j, a0);
                 _mm256_storeu_ps(y + j + 8, a1);
+                _mm256_storeu_ps(y + j + 16, a2);
+                _mm256_storeu_ps(y + j + 24, a3);
             }
             for (; j + 7 < j1; j += 8) {
                 __m256 a = _mm256_loadu_ps(y + j);
-                a = _mm256_fmadd_ps(xv, load_16x8(row + j), a);
+                for (int n = nb; n < ne; ++n)
+                    a = _mm256_fmadd_ps(_mm256_set1_ps(nnz_val[n]),
+                        load_16x8(V + (size_t)nnz_idx[n] * N + j), a);
                 _mm256_storeu_ps(y + j, a);
             }
-            for (; j < j1; j++) y[j] += val * to_f32(row[j]);
+            for (; j < j1; ++j)
+                for (int n = nb; n < ne; ++n)
+                    y[j] += nnz_val[n] * to_f32(V[(size_t)nnz_idx[n] * N + j]);
         }
     }
 }

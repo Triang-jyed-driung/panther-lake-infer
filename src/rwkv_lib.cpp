@@ -680,6 +680,13 @@ static inline void matmul_batch(
     const float *X, const uint16_t *W, float *Y,
     int B, int M, int N)
 {
+    if (B <= 8) {
+        // R/K/V projections alias their inputs; batched GEMV writes directly.
+        AlignedBuffer result((size_t)B * N);
+        gemv_f16_batchT(X, W, result.data(), B, M, N);
+        memcpy(Y, result.data(), (size_t)B * N * sizeof(float));
+        return;
+    }
     gemm<float, unsigned short, float>((size_t)B, (size_t)N, (size_t)M,
                                         X, W, Y, false, false);
 }
@@ -689,8 +696,7 @@ static inline void matmul_1(
     const float *x, const uint16_t *W, float *y,
     int M, int N)
 {
-    gemm<float, unsigned short, float>(1, (size_t)N, (size_t)M,
-                                        x, W, y, false, false);
+    gemv_f16(x, W, y, M, N);
 }
 
 /* ── K normalization + modification ─────────────────────────────── */
@@ -1020,7 +1026,14 @@ void forward_one(
 
         time_shift(xx, t1, L.x_v, vb, dim);
 
-        #pragma omp parallel sections
+        // Small models benefit from independent projection tasks. Large matrices
+        // need all cores streaming one projection together (no nested teams).
+        auto project = [dim](const float *in, const uint16_t *weight,
+                             float *out, int m, int n) {
+            if (dim <= 1024) gemv_f16_st(in, weight, out, m, n);
+            else gemv_f16(in, weight, out, m, n);
+        };
+        #pragma omp parallel sections if(dim <= 1024)
         {
             #pragma omp section
             {
@@ -1038,43 +1051,43 @@ void forward_one(
                 int g1_hidden = L.g1_hidden;
                 int v1_hidden = L.v1_hidden;
 
-                gemv_f16_st(wb, L.w1, tmp, dim, w1_hidden);
+                project(wb, L.w1, tmp, dim, w1_hidden);
                 for (int i = 0; i < w1_hidden; i++) tmp[i] = tanhf(tmp[i]);
-                gemv_f16_st(tmp, L.w2, wb, w1_hidden, dim);
+                project(tmp, L.w2, wb, w1_hidden, dim);
 
                 /* ── a = sigmoid(a0 + (xa @ a1) @ a2) ────────── */
-                gemv_f16_st(ab, L.a1, tmp, dim, a1_hidden);
-                gemv_f16_st(tmp, L.a2, wv_tmp, a1_hidden, dim);
+                project(ab, L.a1, tmp, dim, a1_hidden);
+                project(tmp, L.a2, wv_tmp, a1_hidden, dim);
                 for (int i = 0; i < dim; i++)
                     ab[i] = sigmoid(L.a0[i] + wv_tmp[i]);
 
                 /* ── g = sigmoid(xg @ g1) @ g2 ──────────────── */
-                gemv_f16_st(gb, L.g1, tmp, dim, g1_hidden);
+                project(gb, L.g1, tmp, dim, g1_hidden);
                 for (int i = 0; i < g1_hidden; i++) tmp[i] = sigmoid(tmp[i]);
-                gemv_f16_st(tmp, L.g2, gb, g1_hidden, dim);
+                project(tmp, L.g2, gb, g1_hidden, dim);
 
                 /* ── v0 gate: (vb @ v1) @ v2 → xv  (safe: all sections only read vb) ── */
                 if (l > 0) {
-                    gemv_f16_st(vb, L.v1, tmp, dim, v1_hidden);
-                    gemv_f16_st(tmp, L.v2, xv, v1_hidden, dim);
+                    project(vb, L.v1, tmp, dim, v1_hidden);
+                    project(tmp, L.v2, xv, v1_hidden, dim);
                 }
             }
 
             #pragma omp section
             {
                 time_shift(xx, t1, L.x_r, r,  dim);
-                gemv_f16_st(r, L.R, r_out, dim, dim);
+                project(r, L.R, r_out, dim, dim);
             }
 
             #pragma omp section
             {
                 time_shift(xx, t1, L.x_k, kb, dim);
-                gemv_f16_st(kb, L.K, k_out, dim, dim);
+                project(kb, L.K, k_out, dim, dim);
             }
 
             #pragma omp section
             {
-                gemv_f16_st(vb, L.V, v_out, dim, dim);
+                project(vb, L.V, v_out, dim, dim);
             }
         }
         /* ── K normalize (uses post-projection buffers directly) ── */
@@ -1303,16 +1316,16 @@ void forward_seq(
                     S.att_state_at(l), tmp, T, dim, n_heads, h_size);
 
         /* ── group norm + bonus + output ────────────────────────── */
-        if (l == n_layers - 1) {
-            /* Last layer: only compute O-projection for last token */
-            int t_last = T - 1;
-            group_norm(tmp + t_last * dim, tmp2 + t_last * dim,
+        /* Every layer needs each token's FFN input for the next time shift. */
+        for (int t = 0; t < T; t++)
+            group_norm(tmp + t * dim, tmp2 + t * dim,
                        L.ln_x_w, L.ln_x_b, n_heads, h_size);
 
-            float       *const yt = tmp2 + t_last * dim;
-            const float *const rt = r    + t_last * dim;
-            const float *const kt = kb   + t_last * dim;
-            const float *const vt = vb_  + t_last * dim;
+        for (int t = 0; t < T; t++) {
+            float       *const yt = tmp2 + t * dim;
+            const float *const rt = r    + t * dim;
+            const float *const kt = kb   + t * dim;
+            const float *const vt = vb_  + t * dim;
             for (int h = 0; h < n_heads; h++) {
                 float bonus = 0;
                 for (int j = 0; j < h_size; j++) {
@@ -1322,72 +1335,39 @@ void forward_seq(
                 for (int j = 0; j < h_size; j++)
                     yt[h * h_size + j] += bonus * vt[h * h_size + j];
             }
+        }
 
-            vec_mul(tmp2 + t_last * dim, gb + t_last * dim, dim);
-            matmul_1(tmp2 + t_last * dim, L.O, tmp + t_last * dim, dim, dim);
-            vec_add(x + t_last * dim, tmp + t_last * dim, dim);
+        for (int t = 0; t < T; t++)
+            vec_mul(tmp2 + t * dim, gb + t * dim, dim);
+        matmul_batch(tmp2, L.O, tmp, T, dim, dim);
+        for (int t = 0; t < T; t++)
+            vec_add(x + t * dim, tmp + t * dim, dim);
 
-            /* LN2 + FFN — also only for last token */
-            layer_norm(x + t_last * dim, tmp + t_last * dim, L.ln2_w, L.ln2_b, dim);
+        // Only the final FFN output is consumed in last-logit prefill.
+        // Its time shift still needs the preceding LN2 row; recurrent FFN state
+        // is the final LN2 input, independent of either FFN projection.
+        const bool last_layer = l == n_layers - 1;
+        const int first = last_layer ? std::max(0, T - 2) : 0;
+        /* ── LN2 + channel mix ──────────────────────────────── */
+        for (int t = first; t < T; t++)
+            layer_norm(x + t * dim, tmp + t * dim, L.ln2_w, L.ln2_b, dim);
 
-            {
-                float *const xt = tmp  + t_last * dim;
-                float *const d  = tmp2 + t_last * dim;
-                float *const fxp = S.ffn_x_prev_at(l);
-                for (int i = 0; i < dim; i++) {
-                    d[i] = fxp[i] - xt[i];
-                    fxp[i] = xt[i];
-                }
-                time_shift(xt, d, L.ffn_x_k, kb + t_last * dim, dim);
+        for (int t = first; t < T; t++) {
+            float *const xt = tmp  + t * dim;
+            float *const d  = tmp2 + t * dim;
+            float *const fxp = S.ffn_x_prev_at(l);
+            for (int i = 0; i < dim; i++) {
+                d[i] = fxp[i] - xt[i];
+                fxp[i] = xt[i];
             }
+            time_shift(xt, d, L.ffn_x_k, kb + t * dim, dim);
+        }
 
-            matmul_1(kb + t_last * dim, L.ffn_K, ftmp, dim, ffn_dim);
-            relu_sq(ftmp2, ftmp, ffn_dim);
-            matmul_1(ftmp2, L.ffn_V, tmp + t_last * dim, ffn_dim, dim);
-            vec_add(x + t_last * dim, tmp + t_last * dim, dim);
+        if (last_layer) {
+            gemv_f16(kb + (T - 1) * dim, L.ffn_K, ftmp, dim, ffn_dim);
+            relu_sq(ftmp, ftmp, ffn_dim);
+            gemv_f16_sparse(ftmp, L.ffn_V, x + (T - 1) * dim, ffn_dim, dim);
         } else {
-            /* Intermediate layers: compute for all tokens */
-            for (int t = 0; t < T; t++)
-                group_norm(tmp + t * dim, tmp2 + t * dim,
-                           L.ln_x_w, L.ln_x_b, n_heads, h_size);
-
-            for (int t = 0; t < T; t++) {
-                float       *const yt = tmp2 + t * dim;
-                const float *const rt = r    + t * dim;
-                const float *const kt = kb   + t * dim;
-                const float *const vt = vb_  + t * dim;
-                for (int h = 0; h < n_heads; h++) {
-                    float bonus = 0;
-                    for (int j = 0; j < h_size; j++) {
-                        int idx = h * h_size + j;
-                        bonus += rt[idx] * kt[idx] * L.r_k[idx];
-                    }
-                    for (int j = 0; j < h_size; j++)
-                        yt[h * h_size + j] += bonus * vt[h * h_size + j];
-                }
-            }
-
-            for (int t = 0; t < T; t++)
-                vec_mul(tmp2 + t * dim, gb + t * dim, dim);
-            matmul_batch(tmp2, L.O, tmp, T, dim, dim);
-            for (int t = 0; t < T; t++)
-                vec_add(x + t * dim, tmp + t * dim, dim);
-
-            /* ── LN2 + channel mix ──────────────────────────────── */
-            for (int t = 0; t < T; t++)
-                layer_norm(x + t * dim, tmp + t * dim, L.ln2_w, L.ln2_b, dim);
-
-            for (int t = 0; t < T; t++) {
-                float *const xt = tmp  + t * dim;
-                float *const d  = tmp2 + t * dim;
-                float *const fxp = S.ffn_x_prev_at(l);
-                for (int i = 0; i < dim; i++) {
-                    d[i] = fxp[i] - xt[i];
-                    fxp[i] = xt[i];
-                }
-                time_shift(xt, d, L.ffn_x_k, kb + t * dim, dim);
-            }
-
             matmul_batch(kb, L.ffn_K, ftmp, T, dim, ffn_dim);
             relu_sq(ftmp2, ftmp, TF);
             matmul_batch(ftmp2, L.ffn_V, tmp, T, ffn_dim, dim);

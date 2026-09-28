@@ -46,6 +46,7 @@
 #include <cmath>
 #include <vector>
 #include <functional>
+#include <stdexcept>
 
 #include "../rwkv.h"
 #include "../gemm_fp16.h"
@@ -70,6 +71,8 @@ const uint16_t* prefill(NpuWindow& npu, RWKVWeights* Wd, RWKVState* Dst,
                         EmbeddingTable& emb, SpecSampler& sampler,
                         const int* tokens, int T) {
     const int D = npu.D, n = npu.n;
+    if (T <= 0)
+        throw std::invalid_argument("prefill requires at least one token");
     const int cpu_win = 256;
     float* emb_in = sampler.emb_in;
     float* d_logits = sampler.d_logits;
@@ -87,7 +90,13 @@ const uint16_t* prefill(NpuWindow& npu, RWKVWeights* Wd, RWKVState* Dst,
         last_batch = std::min(n, T - i);
         for (int j = 0; j < last_batch; j++)
             emb.fill_row(emb_in + (size_t)j * D, tokens[i + j]);
+        // The graph always runs n slots; unused rows must be initialized.
+        if (last_batch < n)
+            std::fill(emb_in + (size_t)last_batch * D, emb_in + (size_t)n * D, 0.0f);
         npu.req.infer();
+        // Graph Assign nodes commit slot n-1. Keep only the real prompt tokens.
+        if (last_batch < n)
+            npu.rollback_to(last_batch - 1);
     }
 
     // 返回最后位置的 logits 指针
@@ -111,12 +120,15 @@ DecodeResult spec_decoder(NpuWindow& npu, RWKVWeights* Wd, RWKVState* Dst,
     DecodeResult result{{}, -1};
     const int V = npu.V, D = npu.D, n = npu.n;
     const int npose = n - 1;
+    if (n < 2)
+        throw std::invalid_argument("speculative decoding requires a window of at least two tokens");
     const int dsz = rwkv_state_size(Wd);
     float* emb_in = sampler.emb_in;
     float* d_logits = sampler.d_logits;
 
-    // 快照缓冲
-    float* d_snap = (float*)aligned_alloc(64, (size_t)3 * dsz * 4);
+    // s0 plus n-2 decoded proposals: n-1 snapshots for any fixed graph size.
+    std::vector<float> snapshots((size_t)npose * dsz);
+    float* d_snap = snapshots.data();
 
     // 设置 NPU 输入
     ov::Tensor emb_t(ov::element::f32, ov::Shape{(size_t)n, (size_t)D}, emb_in);
@@ -169,7 +181,6 @@ DecodeResult spec_decoder(NpuWindow& npu, RWKVWeights* Wd, RWKVState* Dst,
             rwkv_state_restore(Dst, d_snap + (size_t)rej * dsz);
         // 应当对齐
     }
-    free(d_snap); // 用完即扔
     if (!done) { // 未完待续
         if (rej == npose) result.next = sampler.sample_f16(lg + npose * (size_t)V, sampler.temperature_t, sampler.top_p_t);
         else result.next = rtok;

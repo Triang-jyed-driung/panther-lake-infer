@@ -8,8 +8,8 @@
  *       test_speed.cpp ../src/rwkv_lib.cpp ../src/gemm_fp16.cpp \
  *       -I../src -lm -flto
  *
- * Run (P-core pinning for consistent latency):
- *   OMP_PLACES="{0:4}:1:4" OMP_PROC_BIND=close taskset -c 0-3 ./test_speed [model.bin] [decode_iters] [prefill_iters]
+ * Run (P-core affinity and thread count are configured in code):
+ *   ./test_speed [model.bin] [decode_iters] [prefill_iters]
  *
  * Iteration counts auto-scale with model size:
  *   Small (dim <= 1024):  decode 200, prefill 10
@@ -34,10 +34,7 @@ int main(int argc, char **argv)
     rwkv_tune_once();
     setbuf(stdout, NULL);
 
-    omp_set_num_threads(4);
-    gemm_fp16_set_num_threads(4);
-
-    printf("RWKV-7 Speed Benchmark  (OMP_NUM_THREADS=4)\n");
+    printf("RWKV-7 Speed Benchmark  (%d OpenMP threads)\n", omp_get_max_threads());
 
     /* load weights */
     const char *path = argc > 1 ? argv[1] : "rwkv7_0.1b_fp16.bin";

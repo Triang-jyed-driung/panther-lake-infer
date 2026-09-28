@@ -6,6 +6,9 @@
 // ============================================================
 
 #include "gemm_fp16.h"
+#ifndef RWKV_ENGINE_EMBEDDED
+#include "alloc.h"
+#endif
 #include "utils_16.h"
 
 #include <immintrin.h>
@@ -86,41 +89,7 @@ static inline void ukernel_8x8(int kc,
     __m256 c6 = _mm256_loadu_ps(c + 6*ldc);
     __m256 c7 = _mm256_loadu_ps(c + 7*ldc);
 
-    // Peel remainder 1..3
-    int k = kc & 3;
-    if (k) { __m256 b0 = _mm256_loadu_ps(pb);
-        c0 = _mm256_fmadd_ps(_mm256_broadcast_ss(pa+0), b0, c0);
-        c1 = _mm256_fmadd_ps(_mm256_broadcast_ss(pa+1), b0, c1);
-        c2 = _mm256_fmadd_ps(_mm256_broadcast_ss(pa+2), b0, c2);
-        c3 = _mm256_fmadd_ps(_mm256_broadcast_ss(pa+3), b0, c3);
-        c4 = _mm256_fmadd_ps(_mm256_broadcast_ss(pa+4), b0, c4);
-        c5 = _mm256_fmadd_ps(_mm256_broadcast_ss(pa+5), b0, c5);
-        c6 = _mm256_fmadd_ps(_mm256_broadcast_ss(pa+6), b0, c6);
-        c7 = _mm256_fmadd_ps(_mm256_broadcast_ss(pa+7), b0, c7);
-        pa += MR; pb += NR; --k;
-        if (k) { __m256 b1 = _mm256_loadu_ps(pb);
-            c0 = _mm256_fmadd_ps(_mm256_broadcast_ss(pa+0), b1, c0);
-            c1 = _mm256_fmadd_ps(_mm256_broadcast_ss(pa+1), b1, c1);
-            c2 = _mm256_fmadd_ps(_mm256_broadcast_ss(pa+2), b1, c2);
-            c3 = _mm256_fmadd_ps(_mm256_broadcast_ss(pa+3), b1, c3);
-            c4 = _mm256_fmadd_ps(_mm256_broadcast_ss(pa+4), b1, c4);
-            c5 = _mm256_fmadd_ps(_mm256_broadcast_ss(pa+5), b1, c5);
-            c6 = _mm256_fmadd_ps(_mm256_broadcast_ss(pa+6), b1, c6);
-            c7 = _mm256_fmadd_ps(_mm256_broadcast_ss(pa+7), b1, c7);
-            pa += MR; pb += NR; --k;
-            if (k) { __m256 b2 = _mm256_loadu_ps(pb);
-                c0 = _mm256_fmadd_ps(_mm256_broadcast_ss(pa+0), b2, c0);
-                c1 = _mm256_fmadd_ps(_mm256_broadcast_ss(pa+1), b2, c1);
-                c2 = _mm256_fmadd_ps(_mm256_broadcast_ss(pa+2), b2, c2);
-                c3 = _mm256_fmadd_ps(_mm256_broadcast_ss(pa+3), b2, c3);
-                c4 = _mm256_fmadd_ps(_mm256_broadcast_ss(pa+4), b2, c4);
-                c5 = _mm256_fmadd_ps(_mm256_broadcast_ss(pa+5), b2, c5);
-                c6 = _mm256_fmadd_ps(_mm256_broadcast_ss(pa+6), b2, c6);
-                c7 = _mm256_fmadd_ps(_mm256_broadcast_ss(pa+7), b2, c7);
-                pa += MR; pb += NR;
-            }
-        }
-    }
+    int k = 0;
     // 4-way unrolled main loop — interleaved for FMA latency hiding
     for (int end4 = kc - 4; k < end4; k += 4) {
         _mm_prefetch((const char *)(pa + 8*MR), _MM_HINT_T0);
@@ -686,12 +655,130 @@ static void fp16_fp16_fp32_gemm_impl(size_t M, size_t N, size_t K,
         B_t?(packB_fn)packB_f16_t:(packB_fn)packB_f16_n,
         C,(int)N);
 }
+// 6x16 AVX2 kernel: twelve independent accumulators amortize broadcasts
+// across two vectors. B is converted once per K/N panel and reused by all
+// token rows. A stays in its original FP32 layout (no repeated A packing).
+static inline void kernel_6x16(int kc, const float *a, int lda,
+                              const float *b, float *c, int ldc) {
+    __m256 c00 = _mm256_loadu_ps(c + 0 * ldc + 0);
+    __m256 c01 = _mm256_loadu_ps(c + 0 * ldc + 8);
+    __m256 c10 = _mm256_loadu_ps(c + 1 * ldc + 0);
+    __m256 c11 = _mm256_loadu_ps(c + 1 * ldc + 8);
+    __m256 c20 = _mm256_loadu_ps(c + 2 * ldc + 0);
+    __m256 c21 = _mm256_loadu_ps(c + 2 * ldc + 8);
+    __m256 c30 = _mm256_loadu_ps(c + 3 * ldc + 0);
+    __m256 c31 = _mm256_loadu_ps(c + 3 * ldc + 8);
+    __m256 c40 = _mm256_loadu_ps(c + 4 * ldc + 0);
+    __m256 c41 = _mm256_loadu_ps(c + 4 * ldc + 8);
+    __m256 c50 = _mm256_loadu_ps(c + 5 * ldc + 0);
+    __m256 c51 = _mm256_loadu_ps(c + 5 * ldc + 8);
+    for (int k = 0; k < kc; ++k) {
+        __m256 b0 = _mm256_loadu_ps(b + k * 16);
+        __m256 b1 = _mm256_loadu_ps(b + k * 16 + 8);
+        __m256 a0 = _mm256_broadcast_ss(a + 0 * lda + k);
+        c00 = _mm256_fmadd_ps(a0, b0, c00);
+        c01 = _mm256_fmadd_ps(a0, b1, c01);
+        __m256 a1 = _mm256_broadcast_ss(a + 1 * lda + k);
+        c10 = _mm256_fmadd_ps(a1, b0, c10);
+        c11 = _mm256_fmadd_ps(a1, b1, c11);
+        __m256 a2 = _mm256_broadcast_ss(a + 2 * lda + k);
+        c20 = _mm256_fmadd_ps(a2, b0, c20);
+        c21 = _mm256_fmadd_ps(a2, b1, c21);
+        __m256 a3 = _mm256_broadcast_ss(a + 3 * lda + k);
+        c30 = _mm256_fmadd_ps(a3, b0, c30);
+        c31 = _mm256_fmadd_ps(a3, b1, c31);
+        __m256 a4 = _mm256_broadcast_ss(a + 4 * lda + k);
+        c40 = _mm256_fmadd_ps(a4, b0, c40);
+        c41 = _mm256_fmadd_ps(a4, b1, c41);
+        __m256 a5 = _mm256_broadcast_ss(a + 5 * lda + k);
+        c50 = _mm256_fmadd_ps(a5, b0, c50);
+        c51 = _mm256_fmadd_ps(a5, b1, c51);
+    }
+    _mm256_storeu_ps(c + 0 * ldc + 0, c00);
+    _mm256_storeu_ps(c + 0 * ldc + 8, c01);
+    _mm256_storeu_ps(c + 1 * ldc + 0, c10);
+    _mm256_storeu_ps(c + 1 * ldc + 8, c11);
+    _mm256_storeu_ps(c + 2 * ldc + 0, c20);
+    _mm256_storeu_ps(c + 2 * ldc + 8, c21);
+    _mm256_storeu_ps(c + 3 * ldc + 0, c30);
+    _mm256_storeu_ps(c + 3 * ldc + 8, c31);
+    _mm256_storeu_ps(c + 4 * ldc + 0, c40);
+    _mm256_storeu_ps(c + 4 * ldc + 8, c41);
+    _mm256_storeu_ps(c + 5 * ldc + 0, c50);
+    _mm256_storeu_ps(c + 5 * ldc + 8, c51);
+}
+
+static void gemm_prefill(int M, int N, int K, const float *A,
+                         const unsigned short *B, float *C) {
+    constexpr int BK = 256;
+    int threads = 1;
+#ifdef _OPENMP
+    threads = omp_get_max_threads();
+#endif
+    // Balance narrow gate projections and 768-wide layers across the team.
+    // Fixed 128-column tiles leave three cores idle for N=128 and distribute
+    // six tiles unevenly for N=768 on four cores.
+    int panels = (N + 127) / 128;
+    panels = ((panels + threads - 1) / threads) * threads;
+    const int BN = ((N + panels * 16 - 1) / (panels * 16)) * 16;
+    // Preserve the API's in-place activation projection support (A == C).
+    AlignedBuffer output((size_t)M * N);
+    float *out = output.data();
+    #pragma omp parallel
+    {
+        THREAD_LOCAL_BUFFER(packed, BK * 128);
+        #pragma omp for schedule(static)
+        for (int jc = 0; jc < N; jc += BN) {
+            int nc = std::min(BN, N - jc);
+            for (int i = 0; i < M; ++i)
+                memset(out + (size_t)i * N + jc, 0, nc * sizeof(float));
+            for (int pc = 0; pc < K; pc += BK) {
+                int kc = std::min(BK, K - pc);
+                // Read complete source cache lines together, avoiding the
+                // repeated strided sweeps of an eight-column packer.
+                for (int k = 0; k < kc; ++k)
+                    for (int j = 0; j < nc; j += 16) {
+                        float *dst = packed + (j / 16) * BK * 16 + k * 16;
+                        const unsigned short *src = B + (size_t)(pc + k) * N + jc + j;
+                        _mm256_storeu_ps(dst, load_16x8(src));
+                        _mm256_storeu_ps(dst + 8, load_16x8(src + 8));
+                    }
+                for (int j = 0; j < nc; j += 16) {
+                    const float *pb = packed + (j / 16) * BK * 16;
+                    int i = 0;
+                    for (; i + 6 <= M; i += 6)
+                        kernel_6x16(kc, A + (size_t)i * K + pc, K,
+                                    pb, out + (size_t)i * N + jc + j, N);
+                    for (; i < M; ++i) {
+                        float *dst = out + (size_t)i * N + jc + j;
+                        __m256 c0 = _mm256_loadu_ps(dst);
+                        __m256 c1 = _mm256_loadu_ps(dst + 8);
+                        for (int k = 0; k < kc; ++k) {
+                            __m256 a = _mm256_set1_ps(A[(size_t)i * K + pc + k]);
+                            c0 = _mm256_fmadd_ps(a, _mm256_loadu_ps(pb + k * 16), c0);
+                            c1 = _mm256_fmadd_ps(a, _mm256_loadu_ps(pb + k * 16 + 8), c1);
+                        }
+                        _mm256_storeu_ps(dst, c0);
+                        _mm256_storeu_ps(dst + 8, c1);
+                    }
+                }
+            }
+        }
+    }
+    memcpy(C, out, (size_t)M * N * sizeof(float));
+}
+
 // 5. f32,f16→f32
 static void fp32_fp16_fp32_gemm_impl(size_t M, size_t N, size_t K,
                     const float *A, const unsigned short *B,
                     float *C, bool A_t, bool B_t)
 {
     if (!M||!N||!K) return;
+    if (!A_t && !B_t && N % 16 == 0 && M >= 6) {
+        gemm_prefill((int)M, (int)N, (int)K, A, B, C);
+        return;
+    }
+
     gemm_core<float, unsigned short, false>(
         (int)M,(int)N,(int)K,
         A, A_t?(int)M:(int)K, A_t,

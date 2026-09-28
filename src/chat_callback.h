@@ -107,8 +107,8 @@ public:
                     state_ = State::STOP;
                     return true;
                 }
-                // 检查是否有换行（前一个token末尾有换行 + 当前token有换行 = 两个连续换行）
-                if (token_text.find('\n') != std::string::npos) {
+                // 非开头的单个换行不会与上一个token末尾的换行相连。
+                if (token_text.find("\n\n") != std::string::npos) {
                     state_ = State::STOP;
                     return true;
                 }

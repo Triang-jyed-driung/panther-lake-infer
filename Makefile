@@ -40,14 +40,20 @@ LIB_SRCS  = $(SRC_DIR)/rwkv_api.cpp
 # engine files pulled in by rwkv_api.cpp (rebuild triggers)
 ENGINE_DEPS = $(SRC_DIR)/rwkv_lib.cpp $(SRC_DIR)/gemm_fp16.cpp \
               $(SRC_DIR)/rwkv.h $(SRC_DIR)/gemv_f16.h $(SRC_DIR)/gemm_fp16.h \
-              $(SRC_DIR)/utils_16.h $(SRC_DIR)/alloc.h
+              $(SRC_DIR)/utils_16.h $(SRC_DIR)/alloc.h $(SRC_DIR)/rwkv_tune.h
 
 LIB_NAME      = librwkv.so
 LIB_NAME_BF16 = librwkv_bf16.so
 
 # ── Default target ────────────────────────────────────────────────
 .PHONY: all
-all: lib test_speed test_correct test_spec test_utils16 test_utils16_bf16 chat
+all: lib test_speed test_correct test_spec test_utils16 test_utils16_bf16 test_tune chat
+
+.PHONY: test_chat_callback
+test_chat_callback: $(BUILD_DIR)/test_chat_callback
+
+$(BUILD_DIR)/test_chat_callback: $(TEST_DIR)/test_chat_callback.cpp $(SRC_DIR)/chat_callback.h $(SRC_DIR)/tokenizer/rwkv_tokenizer.hpp $(SRC_DIR)/tokenizer/vocab_data.hpp | $(BUILD_DIR)
+	$(CXX) $(CXX_FAST) $(INCLUDES) -o $@ $< $(LDFLAGS)
 
 # ── Build directory ───────────────────────────────────────────────
 $(BUILD_DIR):
@@ -68,10 +74,19 @@ $(LIB_NAME_BF16): $(LIB_NAME)
 	cp $(LIB_NAME) $@
 
 # ── Tests (compiled without -fPIC for max speed) ──────────────────
+$(BUILD_DIR)/test_tune: $(TEST_DIR)/test_tune.cpp $(SRC_DIR)/rwkv_tune.h | $(BUILD_DIR)
+	$(CXX) $(CXX_FAST) $(INCLUDES) -o $@ $< $(LDFLAGS)
+
+.PHONY: test_tune
+test_tune: $(BUILD_DIR)/test_tune
+
 $(BUILD_DIR)/test_speed: $(TEST_DIR)/test_speed.cpp $(LIB_SRCS) $(ENGINE_DEPS) | $(BUILD_DIR)
 	$(CXX) $(CXX_FAST) $(INCLUDES) -o $@ $< $(LIB_SRCS) $(LDFLAGS)
 
 $(BUILD_DIR)/test_correctness: $(TEST_DIR)/test_correctness.cpp $(LIB_SRCS) $(ENGINE_DEPS) | $(BUILD_DIR)
+	$(CXX) $(CXX_FAST) $(INCLUDES) -o $@ $< $(LIB_SRCS) $(LDFLAGS)
+
+$(BUILD_DIR)/test_prefill_equivalence: $(TEST_DIR)/test_prefill_equivalence.cpp $(LIB_SRCS) $(ENGINE_DEPS) | $(BUILD_DIR)
 	$(CXX) $(CXX_FAST) $(INCLUDES) -o $@ $< $(LIB_SRCS) $(LDFLAGS)
 
 $(BUILD_DIR)/test_spec: $(TEST_DIR)/test_spec.cpp $(LIB_SRCS) $(ENGINE_DEPS) | $(BUILD_DIR)
@@ -100,6 +115,9 @@ test_speed: $(BUILD_DIR)/test_speed
 
 .PHONY: test_correct
 test_correct: $(BUILD_DIR)/test_correctness
+
+.PHONY: test_prefill_equivalence
+test_prefill_equivalence: $(BUILD_DIR)/test_prefill_equivalence
 
 .PHONY: test_spec
 test_spec: $(BUILD_DIR)/test_spec
@@ -134,6 +152,7 @@ test_ablate: $(BUILD_DIR)/test_ablate
 SPEC_SRCS = $(SRC_DIR)/npu/spec.cpp
 SPEC_DEPS = $(SRC_DIR)/npu/spec.cpp $(SRC_DIR)/npu/spec_api.h $(SRC_DIR)/npu/spec_sampler.h \
             $(SRC_DIR)/npu/npu_window.h $(SRC_DIR)/npu/common.h $(SRC_DIR)/chat_callback.h
+
 $(BUILD_DIR)/chat: examples/chat.cpp $(SPEC_SRCS) $(LIB_SRCS) $(ENGINE_DEPS) $(SPEC_DEPS) | $(BUILD_DIR)
 	$(CXX) $(CXX_FAST) $(INCLUDES) -o $@ $< $(SPEC_SRCS) $(LIB_SRCS) $(LDFLAGS) $(OV_LDFLAGS) -lpthread
 
@@ -151,3 +170,18 @@ chat: $(BUILD_DIR)/chat
 .PHONY: clean
 clean:
 	rm -rf $(BUILD_DIR) $(LIB_NAME) $(LIB_NAME_BF16)
+
+# Standalone CPU kernel correctness and shape benchmarks (no model required).
+.PHONY: test_cpu_kernels test_cpu_kernels_bf16
+test_cpu_kernels: $(BUILD_DIR)/test_cpu_kernels
+test_cpu_kernels_bf16: $(BUILD_DIR)/test_cpu_kernels_bf16
+$(BUILD_DIR)/test_cpu_kernels: $(TEST_DIR)/test_cpu_kernels.cpp $(SRC_DIR)/gemm_fp16.cpp $(ENGINE_DEPS) | $(BUILD_DIR)
+	$(CXX) $(CXX_FAST) $(INCLUDES) -o $@ $< $(SRC_DIR)/gemm_fp16.cpp $(LDFLAGS)
+$(BUILD_DIR)/test_cpu_kernels_bf16: $(TEST_DIR)/test_cpu_kernels.cpp $(SRC_DIR)/gemm_fp16.cpp $(ENGINE_DEPS) | $(BUILD_DIR)
+	$(CXX) $(CXX_FAST) $(INCLUDES) -DRWKV_WEIGHTS_BF16 -o $@ $< $(SRC_DIR)/gemm_fp16.cpp $(LDFLAGS)
+
+# Real-device GPU state regression (requires a compiled GPU window blob).
+.PHONY: test_gpu_control
+test_gpu_control: $(BUILD_DIR)/test_gpu_control
+$(BUILD_DIR)/test_gpu_control: $(TEST_DIR)/test_gpu_control.cpp $(SPEC_DEPS) | $(BUILD_DIR)
+	$(CXX) $(CXX_FAST) $(INCLUDES) -o $@ $< $(LDFLAGS) $(OV_LDFLAGS) -lpthread

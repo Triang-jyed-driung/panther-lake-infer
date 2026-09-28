@@ -19,6 +19,7 @@ struct DecodeResult {
 
 // prefill — 阅读模式
 // 同步处理 token 序列，两模型状态一致推进
+// T must be positive. Partial fixed-size windows roll back to the last valid slot.
 // 返回：最后位置的 logits 指针（供 spec_decoder 首次采样）
 const uint16_t* prefill(NpuWindow& npu, RWKVWeights* Wd, RWKVState* Dst,
                         EmbeddingTable& emb, SpecSampler& sampler,

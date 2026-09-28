@@ -45,6 +45,14 @@ typedef struct RWKVState   RWKVState;
 
 /* ── Lifecycle ────────────────────────────────────────────────────── */
 
+/* Usage contract: model switching and concurrent inference are unsupported.
+ * Bind each application engine object to one model for its lifetime. All CPU
+ * inference calls must be serialized, including calls using different states
+ * or engine objects. Internal scratch is process-wide, not object-owned;
+ * creating a new object alone does not make switching models safe. Run a new
+ * model in a fresh process with a new engine object. Weight files are assumed
+ * to be trusted, well-formed files produced by the bundled converter. */
+
 /* Load weights from a .bin file (fp16 format). Returns NULL on failure. */
 RWKV_API RWKVWeights *rwkv_weights_load(const char *path);
 
