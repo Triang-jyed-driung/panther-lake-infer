@@ -28,6 +28,7 @@
 #include <vector>
 #include <string>
 #include <algorithm>
+#include <new>
 
 #include <omp.h>
 #include <immintrin.h>
@@ -88,6 +89,7 @@ static inline __m256 exp256_ps(__m256 x)
 // ===========================================================================
 
 static inline void* aligned_malloc(size_t bytes) {
+    if (bytes > SIZE_MAX - 63) return nullptr;
     size_t aligned_bytes = (bytes + 63) & ~63;
     return std::aligned_alloc(64, aligned_bytes);
 }
@@ -121,7 +123,14 @@ struct AlignedBuffer {
     }
 
     void resize(size_t n) {
-        if (n > cap_) { aligned_free(ptr_); ptr_ = aligned_alloc_float(n); cap_ = n; }
+        if (n > cap_) {
+            if (n > SIZE_MAX / sizeof(float)) throw std::bad_alloc();
+            float *next = aligned_alloc_float(n);
+            if (!next) throw std::bad_alloc();
+            aligned_free(ptr_);
+            ptr_ = next;
+            cap_ = n;
+        }
     }
     void zero() { if (ptr_) std::memset(ptr_, 0, cap_ * sizeof(float)); }
     float* data() { return ptr_; }
@@ -718,7 +727,7 @@ static inline void k_normalize(
                 kkt[idx] = val;
                 sum_sq += (double)val * val;
             }
-            float inv = 1.0 / sqrt(sum_sq);
+            float inv = 1.0 / std::max(sqrt(sum_sq), 1e-12);
             for (int j = 0; j < h_size; j++)
                 kkt[h * h_size + j] *= inv;
         }
@@ -751,7 +760,7 @@ static inline void k_normalize(
                 k8 = _mm256_mul_ps(k8, k8);
                 sum_sq   += sum256(k8);
             }
-            __m256 inv = _mm256_set1_ps(1.0f / sqrtf(sum_sq));
+            __m256 inv = _mm256_set1_ps(1.0f / std::max(sqrtf(sum_sq), 1e-12f));
             __m256 i1 = _mm256_set1_ps(1.0f);
             for (int j = 0; j < h_size; j += 8){
                 int idx = h * h_size + j;
@@ -1159,7 +1168,25 @@ void forward_one(
  * Forward pass — sequence (prefill)  — fp16 gemm
  * ════════════════════════════════════════════════════════════════════ */
 
-void forward_seq(
+// Check before multiplying: converting an already-overflowed int to size_t
+// does not repair it. These helpers also protect the allocation byte count.
+static size_t checked_size_mul(size_t a, size_t b)
+{
+    if (b && a > SIZE_MAX / b) throw std::bad_alloc();
+    return a * b;
+}
+
+static size_t prefill_buffer_size(size_t TC, size_t TF)
+{
+    size_t c = checked_size_mul(12, TC);
+    size_t f = checked_size_mul(2, TF);
+    if (c > SIZE_MAX - f) throw std::bad_alloc();
+    if (checked_size_mul(c + f, sizeof(float)) > SIZE_MAX - 63)
+        throw std::bad_alloc();
+    return c + f;
+}
+
+static void forward_seq_chunk(
     const Weights &W, State &S,
     const int *tokens, int T,
     float *const logits)
@@ -1170,8 +1197,8 @@ void forward_seq(
     int vocab    = W.vocab;
     int ffn_dim  = W.ffn_dim;
 
-    int TC = T * dim;
-    int TF = T * ffn_dim;
+    const size_t TC = checked_size_mul((size_t)T, (size_t)dim);
+    const size_t TF = checked_size_mul((size_t)T, (size_t)ffn_dim);
 
     /* buffer layout:
      *   0:  x      1:  r      2:  wb     3:  kb     4:  vb_
@@ -1180,7 +1207,7 @@ void forward_seq(
      *   11+2*TF: v_first (TC)
      */
     static AlignedBuffer buf_storage;
-    size_t buf_size = 11 * TC + 2 * TF + TC;  // 12 * TC + 2 * TF
+    size_t buf_size = prefill_buffer_size(TC, TF);
     buf_storage.resize(buf_size);
     float *const buf = buf_storage.data();
 
@@ -1377,11 +1404,27 @@ void forward_seq(
     }
 
     /* ── final LN + head (last token only) ────────────────────── */
-    {
+    if (logits) {
         float *const x_last  = x   + (T - 1) * dim;
         float *const xx_last = tmp + (T - 1) * dim;  /* reuse tmp for LN output */
         layer_norm(x_last, xx_last, W.ln_out_w, W.ln_out_b, dim);
         matmul_1(xx_last, W.head, logits, dim, vocab);
+    }
+}
+
+void forward_seq(
+    const Weights &W, State &S,
+    const int *tokens, int T, float *const logits)
+{
+    // Bound activation memory independently of prompt length. Each chunk
+    // commits its recurrent state, including the final layer's LN2 history.
+    // Only the final chunk needs the vocabulary projection.
+    constexpr int chunk_size = 256;
+    for (int done = 0; done < T;) {
+        int count = std::min(chunk_size, T - done);
+        forward_seq_chunk(W, S, tokens + done, count,
+                          count == T - done ? logits : nullptr);
+        done += count;
     }
 }
 

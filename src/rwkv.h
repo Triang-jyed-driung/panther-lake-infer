@@ -105,6 +105,7 @@ RWKV_API void rwkv_decode(
  *            computed — sufficient for next-token prediction)
  *
  * Internal scratch buffers are managed automatically (static).
+ * Prompts are processed in chunks of at most 256 tokens to bound scratch memory.
  */
 RWKV_API void rwkv_prefill(
     RWKVWeights *w, RWKVState *s,

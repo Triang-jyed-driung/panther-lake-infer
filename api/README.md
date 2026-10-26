@@ -4,7 +4,7 @@
 
 ## 特性
 
-- **OpenAI兼容**：支持 `/v1/chat/completions` 和 `/v1/models` 端点
+- **OpenAI兼容**：支持 `/v1/chat/completions`、`/v1/completions` 和 `/v1/models` 端点
 - **CPU线程配置**：同步API和推理使用4个OpenMP线程，共享大核0-3；启动时自动配置，无需额外线程绑定命令
 - **状态缓存**：基于token序列hash的LRU缓存，默认保存3个状态；同时保存最后一个有效prompt位置的fp16 logits，完整缓存命中可直接继续采样。缓存格式为v3，旧版缓存不兼容，读取失败时重新prefill。
 - **流式响应**：支持SSE流式输出，正确处理UTF-8多字节字符
@@ -75,6 +75,18 @@ POST /v1/chat/completions
 ```
 GET /v1/models
 ```
+
+### 文本续写
+
+`POST /v1/completions` 接收原始字符串 `prompt`，不添加聊天角色或模板前缀；支持 `temperature`、`top_p`、`max_tokens`、`stop` 和 `stream`。
+
+```bash
+curl http://localhost:8080/v1/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"rwkv-7","prompt":"Once upon a time","max_tokens":128,"stream":false}'
+```
+
+响应文本位于 `choices[0].text`。`stream: true` 时返回 SSE 文本片段并以 `[DONE]` 结束。
 
 ### 健康检查
 

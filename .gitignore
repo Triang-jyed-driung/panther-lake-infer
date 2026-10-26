@@ -9,6 +9,7 @@ build/
 *.bin
 *.pth
 *.sh
+*.blob
 
 # Python
 __pycache__/
@@ -25,6 +26,14 @@ Thumbs.db
 
 api/moc/
 api/build/
+
+# Generated OpenVINO models and runtime files
+scripts/npu/export/
+scripts/npu/npu_cache/
+run/
+
+# Machine-specific 7B launcher (contains local model paths)
+start_7b.sh
 
 benchmark_results/
 tests/

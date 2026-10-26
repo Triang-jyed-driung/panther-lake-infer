@@ -53,6 +53,41 @@ struct ChatCompletionRequest {
     }
 };
 
+// Raw-prompt OpenAI text completion request.
+struct CompletionRequest {
+    QString model = "rwkv-7";
+    QString prompt;
+    double temperature = 1.0;
+    double top_p = 1.0;
+    int max_tokens = 2048;
+    bool stream = false;
+    QString stop;
+
+    static bool fromJson(const QJsonObject& obj, CompletionRequest& req,
+                         QString& error) {
+        const QJsonValue promptValue = obj.value("prompt");
+        if (!promptValue.isString()) {
+            error = "prompt must be a string";
+            return false;
+        }
+        req.model = obj.value("model").toString("rwkv-7");
+        req.prompt = promptValue.toString();
+        if (req.prompt.isEmpty()) {
+            error = "prompt must not be empty";
+            return false;
+        }
+        req.temperature = obj.value("temperature").toDouble(1.0);
+        req.top_p = obj.value("top_p").toDouble(1.0);
+        req.max_tokens = obj.value("max_tokens").toInt(2048);
+        req.stream = obj.value("stream").toBool(false);
+        const QJsonValue stopValue = obj.value("stop");
+        if (stopValue.isString()) req.stop = stopValue.toString();
+        else if (stopValue.isArray() && !stopValue.toArray().isEmpty())
+            req.stop = stopValue.toArray().first().toString();
+        return true;
+    }
+};
+
 // Usage Info
 struct UsageInfo {
     int prompt_tokens = 0;
@@ -108,6 +143,33 @@ struct ChatCompletionResponse {
             {"choices", choicesArr},
             {"usage", usage.toJson()}
         };
+    }
+};
+
+struct CompletionChoice {
+    int index = 0;
+    QString text;
+    QString finish_reason = "stop";
+
+    QJsonObject toJson() const {
+        return {{"index", index}, {"text", text}, {"logprobs", QJsonValue::Null},
+                {"finish_reason", finish_reason}};
+    }
+};
+
+struct CompletionResponse {
+    QString id;
+    QString object = "text_completion";
+    qint64 created = 0;
+    QString model;
+    std::vector<CompletionChoice> choices;
+    UsageInfo usage;
+
+    QJsonObject toJson() const {
+        QJsonArray choicesArr;
+        for (const auto& choice : choices) choicesArr.append(choice.toJson());
+        return {{"id", id}, {"object", object}, {"created", created},
+                {"model", model}, {"choices", choicesArr}, {"usage", usage.toJson()}};
     }
 };
 

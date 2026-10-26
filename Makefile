@@ -119,6 +119,15 @@ test_correct: $(BUILD_DIR)/test_correctness
 .PHONY: test_prefill_equivalence
 test_prefill_equivalence: $(BUILD_DIR)/test_prefill_equivalence
 
+.PHONY: test_cpu_edge_cases
+test_cpu_edge_cases: $(BUILD_DIR)/test_cpu_edge_cases $(BUILD_DIR)/test_cpu_edge_cases_scalar
+
+$(BUILD_DIR)/test_cpu_edge_cases: $(TEST_DIR)/test_cpu_edge_cases.cpp $(ENGINE_DEPS) | $(BUILD_DIR)
+	$(CXX) $(CXX_FAST) $(INCLUDES) -o $@ $< $(LDFLAGS)
+
+$(BUILD_DIR)/test_cpu_edge_cases_scalar: $(TEST_DIR)/test_cpu_edge_cases.cpp $(ENGINE_DEPS) | $(BUILD_DIR)
+	$(CXX) $(CXX_FAST) $(INCLUDES) -DABLATE_K_NORMALIZE -o $@ $< $(LDFLAGS)
+
 .PHONY: test_spec
 test_spec: $(BUILD_DIR)/test_spec
 

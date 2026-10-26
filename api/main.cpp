@@ -70,6 +70,7 @@ int main(int argc, char *argv[]) {
     printf("========================================\n");
     printf("Server: http://localhost:%d\n", port);
     printf("API:    POST /v1/chat/completions\n");
+    printf("API:    POST /v1/completions\n");
     printf("Models: GET  /v1/models\n");
     printf("Health: GET  /health\n");
     printf("========================================\n\n");

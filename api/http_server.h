@@ -173,6 +173,8 @@ private:
         // 路由
         if (path == "/v1/chat/completions" && method == "POST") {
             handleChatCompletions(socket, body);
+        } else if (path == "/v1/completions" && method == "POST") {
+            handleCompletions(socket, body);
         } else if (path == "/v1/models" && method == "GET") {
             handleModels(socket);
         } else if (path == "/health" || path == "/") {
@@ -205,6 +207,77 @@ private:
             // 非流式响应
             handleNonStreamResponse(socket, req, id, created);
         }
+    }
+
+    void handleCompletions(QTcpSocket* socket, const QByteArray& body) {
+        QJsonParseError error;
+        const QJsonDocument doc = QJsonDocument::fromJson(body, &error);
+        if (error.error != QJsonParseError::NoError || !doc.isObject()) {
+            sendError(socket, 400, "Invalid JSON: " + error.errorString());
+            return;
+        }
+        CompletionRequest req;
+        QString validationError;
+        if (!CompletionRequest::fromJson(doc.object(), req, validationError)) {
+            sendError(socket, 400, validationError);
+            return;
+        }
+
+        const QString id = generateId("cmpl");
+        const qint64 created = QDateTime::currentSecsSinceEpoch();
+        if (req.stream) handleCompletionStream(socket, req, id, created);
+        else handleCompletionNonStream(socket, req, id, created);
+    }
+
+    void handleCompletionNonStream(QTcpSocket* socket,
+                                   const CompletionRequest& req,
+                                   const QString& id, qint64 created) {
+        const auto result = engine_->generatePrompt(req.prompt.toStdString(),
+            req.temperature, req.top_p, req.max_tokens, req.stop);
+        CompletionResponse response;
+        response.id = id;
+        response.created = created;
+        response.model = req.model;
+        response.choices.push_back({0, result.text, result.finish_reason});
+        response.usage.prompt_tokens = result.prompt_tokens;
+        response.usage.completion_tokens = result.completion_tokens;
+        response.usage.total_tokens = result.prompt_tokens + result.completion_tokens;
+        sendJsonResponse(socket, 200, response.toJson());
+    }
+
+    void handleCompletionStream(QTcpSocket* socket,
+                                const CompletionRequest& req,
+                                const QString& id, qint64 created) {
+        socket->write("HTTP/1.1 200 OK\r\n"
+                      "Content-Type: text/event-stream\r\n"
+                      "Cache-Control: no-cache\r\n"
+                      "Connection: close\r\n"
+                      "Access-Control-Allow-Origin: *\r\n\r\n");
+        socket->flush();
+
+        const auto result = engine_->generatePrompt(req.prompt.toStdString(),
+            req.temperature, req.top_p, req.max_tokens, req.stop,
+            [socket, id, created, &req](const QString& text) {
+                QJsonObject choice{{"index", 0}, {"text", text},
+                                   {"logprobs", QJsonValue::Null},
+                                   {"finish_reason", QJsonValue::Null}};
+                QJsonObject chunk{{"id", id}, {"object", "text_completion"},
+                                  {"created", created}, {"model", req.model},
+                                  {"choices", QJsonArray{choice}}};
+                socket->write("data: " + QJsonDocument(chunk).toJson(QJsonDocument::Compact)
+                              + "\n\n");
+                socket->flush();
+            });
+
+        QJsonObject finalChoice{{"index", 0}, {"text", ""},
+                                {"logprobs", QJsonValue::Null},
+                                {"finish_reason", result.finish_reason}};
+        QJsonObject finalChunk{{"id", id}, {"object", "text_completion"},
+                               {"created", created}, {"model", req.model},
+                               {"choices", QJsonArray{finalChoice}}};
+        socket->write("data: " + QJsonDocument(finalChunk).toJson(QJsonDocument::Compact)
+                      + "\n\ndata: [DONE]\n\n");
+        socket->flush();
     }
 
     // 处理非流式响应

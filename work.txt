@@ -1,0 +1,4 @@
+Read this project, and optimize prefill and decode on CPU.
+1. For prefill, if not full output, you can take shortcuts on the computation of the last layer ffn.
+2. #pragma omp parallel sections only gains for 0.1B and 0.4B. For 7B, it is better to use tensor parallel (gemv mt).
+3. Optimize both GEMV and GEMM, especially GEMM. You can search for better GEMM code too.

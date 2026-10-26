@@ -115,10 +115,19 @@ public:
                            int max_tokens = 2048,
                            const QString& stop = QString(),
                            std::function<void(const QString&)> stream_callback = nullptr) {
+        return generatePrompt(buildPrompt(messages), temperature, top_p,
+                              max_tokens, stop, std::move(stream_callback), true);
+    }
+
+    GenerateResult generatePrompt(const std::string& prompt,
+                                  double temperature = 1.0,
+                                  double top_p = 1.0,
+                                  int max_tokens = 2048,
+                                  const QString& stop = QString(),
+                                  std::function<void(const QString&)> stream_callback = nullptr,
+                                  bool stop_on_chat_marker = false) {
         QMutexLocker lock(&mutex_);
 
-        // 构建prompt
-        std::string prompt = buildPrompt(messages);
         std::vector<int32_t> tokens = tokenizer_.encode(prompt);
 
         // 更新采样器参数
@@ -257,8 +266,11 @@ public:
             DecodeResult res = spec_decoder(
                 npu_, draft_, state_, emb_, *sampler_,
                 lg, next_token,
-                [&callback, &remaining, &stopped_by_chat](int id) {
-                    stopped_by_chat = callback.on_token(id);
+                [&callback, &remaining, &stopped_by_chat, stop_on_chat_marker](int id) {
+                    // Token 0 is the model's end marker in both APIs; only
+                    // the chat endpoint additionally treats blank lines as EOS.
+                    stopped_by_chat = stop_on_chat_marker
+                        ? callback.on_token(id) : id == 0;
                     --remaining;
                     // The decoder includes the token that stops the callback.
                     // Stop within the batch so committed state and output agree.

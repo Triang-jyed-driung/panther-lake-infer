@@ -57,7 +57,7 @@ def forward_one(x, axp, ast, fxp, vf):
         for h in range(H):
             s, e = h * N, (h + 1) * N
             vals = k_[s:e] * W[f'L{l}.att.k_k'][s:e]
-            kk[s:e] = vals / np.sqrt((vals ** 2).sum())
+            kk[s:e] = vals / np.maximum(np.sqrt((vals ** 2).sum()), 1e-12)
         k_ = k_ * (1 + (a_ - 1) * W[f'L{l}.att.k_a'])
         if l == 0:
             vf = v_.copy()

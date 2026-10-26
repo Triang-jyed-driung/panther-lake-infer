@@ -1,0 +1,117 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>RWKV 续写</title>
+  <style>
+    :root { color-scheme: light dark; font: 15px/1.5 system-ui, sans-serif; }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: #101318; color: #e8eaf0; }
+    main { width: min(900px, calc(100% - 32px)); margin: 36px auto; }
+    h1 { margin: 0 0 6px; font-size: 22px; }
+    .hint { margin: 0 0 20px; color: #9ba3b4; }
+    label { display: block; margin: 14px 0 6px; color: #c6ccda; font-size: 13px; }
+    textarea, input { width: 100%; border: 1px solid #343a48; border-radius: 8px; background: #191e27; color: inherit; padding: 11px 12px; font: inherit; }
+    textarea { resize: vertical; }
+    #prompt { min-height: 190px; }
+    #output { min-height: 260px; white-space: pre-wrap; overflow-wrap: anywhere; }
+    .row { display: flex; gap: 14px; }
+    .row > div { flex: 1; min-width: 0; }
+    .actions { display: flex; align-items: center; gap: 10px; margin-top: 16px; }
+    button { border: 0; border-radius: 8px; padding: 9px 17px; background: #7c9cff; color: #101318; font: 600 14px system-ui, sans-serif; cursor: pointer; }
+    button.secondary { background: #303746; color: #e8eaf0; }
+    button:disabled { opacity: .55; cursor: wait; }
+    #status { color: #9ba3b4; font-size: 13px; }
+    .output-head { display: flex; justify-content: space-between; align-items: center; }
+    .output-head label { margin-bottom: 6px; }
+    @media (max-width: 560px) { main { margin: 22px auto; } .row { gap: 8px; } }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>RWKV 续写</h1>
+    <p class="hint">输入开头，模型会从末尾接着写。生成结果可继续编辑后再次续写。</p>
+    <label for="prompt">提示词</label>
+    <textarea id="prompt" placeholder="在这里输入要续写的文本……"></textarea>
+    <div class="row">
+      <div><label for="maxTokens">最大生成 token</label><input id="maxTokens" type="number" min="1" max="8192" value="256"></div>
+      <div><label for="temperature">Temperature</label><input id="temperature" type="number" min="0" max="2" step="0.05" value="1"></div>
+      <div><label for="topP">Top P</label><input id="topP" type="number" min="0.01" max="1" step="0.05" value="0.9"></div>
+    </div>
+    <div class="actions">
+      <button id="generate">开始续写</button>
+      <button id="stop" class="secondary" disabled>停止</button>
+      <span id="status">就绪</span>
+    </div>
+    <div class="output-head"><label for="output">续写结果</label><button id="copy" class="secondary">复制结果</button></div>
+    <textarea id="output" readonly placeholder="生成内容会显示在这里……"></textarea>
+  </main>
+  <script>
+    const prompt = document.querySelector('#prompt');
+    const output = document.querySelector('#output');
+    const generate = document.querySelector('#generate');
+    const stop = document.querySelector('#stop');
+    const status = document.querySelector('#status');
+    let controller;
+
+    generate.addEventListener('click', async () => {
+      if (!prompt.value.trim()) { status.textContent = '请先输入提示词'; prompt.focus(); return; }
+      controller = new AbortController();
+      generate.disabled = true;
+      stop.disabled = false;
+      output.value = '';
+      status.textContent = '生成中…';
+      try {
+        const response = await fetch('http://127.0.0.1:8080/v1/completions', {
+          method: 'POST',
+          // text/plain avoids a CORS preflight; the API parses the body as JSON.
+          headers: { 'Content-Type': 'text/plain' },
+          body: JSON.stringify({
+            model: 'rwkv-7-0.1b',
+            prompt: prompt.value,
+            max_tokens: Number(document.querySelector('#maxTokens').value),
+            temperature: Number(document.querySelector('#temperature').value),
+            top_p: Number(document.querySelector('#topP').value),
+            stream: true
+          }),
+          signal: controller.signal
+        });
+        if (!response.ok) throw new Error(await response.text());
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let pending = '';
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          pending += decoder.decode(value, { stream: true }).replace(/\r\n/g, '\n');
+          const events = pending.split('\n\n');
+          pending = events.pop();
+          for (const event of events) {
+            for (const line of event.split('\n')) {
+              if (!line.startsWith('data:')) continue;
+              const data = line.slice(5).trim();
+              if (!data || data === '[DONE]') continue;
+              const chunk = JSON.parse(data);
+              output.value += chunk.choices?.[0]?.text ?? '';
+              output.scrollTop = output.scrollHeight;
+            }
+          }
+        }
+        status.textContent = '完成';
+      } catch (error) {
+        status.textContent = error.name === 'AbortError' ? '已停止' : `请求失败：${error.message}`;
+      } finally {
+        generate.disabled = false;
+        stop.disabled = true;
+        controller = undefined;
+      }
+    });
+    stop.addEventListener('click', () => controller?.abort());
+    document.querySelector('#copy').addEventListener('click', async () => {
+      await navigator.clipboard.writeText(output.value);
+      status.textContent = '已复制';
+    });
+  </script>
+</body>
+</html>
